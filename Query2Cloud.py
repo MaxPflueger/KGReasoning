@@ -10,21 +10,27 @@ from tqdm import tqdm
 class Score_Func(nn.Module):
     def __init__(self):
         super().__init__()
-        self.score_func = SamplesLoss(loss="sinkhorn", blur=.05, p=2)
+        self.score_func = SamplesLoss(loss='sinkhorn', blur=.05, p=2)
 
-
-    def forward(self, embeds1,embeds2):
-        #
-        if(embeds1.shape == embeds2.shape):
+    def forward(self, embeds1, embeds2, mode='batch'):
+        if embeds1.shape == embeds2.shape:
             return self.score_func(embeds1, embeds2)
+        elif mode == 'batch':
+            # If batchsize is large in comparison to number of negative samples - usually the case
+            distances = torch.zeros(embeds2.shape[0], embeds2.shape[1])
+            embeds2 = embeds2.transpose(0,1)
+            for i in range(embeds2.shape[0]):
+                    distances[:,i] = self.score_func(embeds1, embeds2[i])
+            return distances
         else:
+            # If batchsize is small in comparison to number of negative samples
             distances = torch.zeros(embeds2.shape[0], embeds2.shape[1])
             for i in range(embeds2.shape[0]):
-                for j in range(embeds2.shape[1]):
-                    distances[i][j] = self.score_func(embeds1[i], embeds2[i][j])
+                    h = embeds2[i]
+                    g = embeds1[i].repeat(embeds2.shape[1], 1, 1)
+                    res = self.score_func(g, h)
+                    distances[i,:] = res
             return distances
-
-
 
 
 class CloudEncoder(nn.Module):
@@ -70,14 +76,20 @@ class CloudIntersection(nn.Module):
         self.post_mats2 = nn.Parameter(torch.FloatTensor(n_vec, embedding_dim, embedding_dim))
         init.xavier_uniform_(self.post_mats2)
 
-    def forward(self, embeds1, embeds2):
+    def forward(self, embeds1, embeds2, embeds3=None):
         embeds1 = F.leaky_relu(torch.bmm(embeds1, self.pre_mats.repeat(embeds1.shape[0],1,1)))
         embeds2 = F.leaky_relu(torch.bmm(embeds2, self.pre_mats.repeat(embeds2.shape[0],1,1)))
         agg_embeds1 = self.intra_cloud_agg(embeds1, dim=1)[0]
         agg_embeds2 = self.intra_cloud_agg(embeds2, dim=1)[0]
         agg_embeds1 = F.leaky_relu(torch.mm(agg_embeds1, self.post_mats))
         agg_embeds2 = F.leaky_relu(torch.mm(agg_embeds2, self.post_mats))
-        intersect = self.inter_cloud_agg(torch.stack([agg_embeds1,agg_embeds2]),dim=0)
+        if embeds3 != None:
+            embeds3 = F.leaky_relu(torch.bmm(embeds3, self.pre_mats.repeat(embeds3.shape[0],1,1)))
+            agg_embeds3 = self.intra_cloud_agg(embeds3, dim=1)[0]
+            agg_embeds3 = F.leaky_relu(torch.mm(agg_embeds3, self.post_mats))
+            intersect = self.inter_cloud_agg(torch.stack([agg_embeds1, agg_embeds2 , agg_embeds3]), dim=0)
+        else:
+            intersect = self.inter_cloud_agg(torch.stack([agg_embeds1,agg_embeds2]),dim=0)
         intersect = F.leaky_relu(torch.mm(intersect, self.pre_mats2))
         intersect = intersect.repeat(self.n_vec, 1, 1)
         intersect = torch.bmm(intersect, self.post_mats2)
@@ -97,47 +109,38 @@ class Query2Cloud(nn.Module):
         self.nentity = nentity
         self.nrelation = nrelation
         self.hidden_dim = hidden_dim
-        self.epsilon = 2.0
         self.geo = geo
         self.use_cuda = use_cuda
         self.batch_entity_range = torch.arange(nentity).to(torch.float).repeat(test_batch_size, 1).cuda() if self.use_cuda else torch.arange(
             nentity).to(torch.float).repeat(test_batch_size, 1)  # used in test_step
         self.query_name_dict = query_name_dict
 
-        # self.gamma = nn.Parameter(
-        #     torch.Tensor([gamma]),
-        #     requires_grad=False
-        # )
-        #
-        # self.embedding_range = nn.Parameter(
-        #     torch.Tensor([(self.gamma.item() + self.epsilon) / hidden_dim]),
-        #     requires_grad=False
-        # )
-
         self.entity_dim = hidden_dim
         self.relation_dim = hidden_dim
         self.n_vec = 8
 
         self.entity_embedding = CloudEncoder(self.nentity, self.entity_dim, self.n_vec)  # center for entities
-
-        # nn.init.uniform_(
-        #     tensor=self.entity_embedding,
-        #     a=-self.embedding_range.item(),
-        #     b=self.embedding_range.item()
-        # )
-
-        # nn.init.uniform_(
-        #     tensor=self.relation_embedding,
-        #     a=-self.embedding_range.item(),
-        #     b=self.embedding_range.item()
-        # )
-
         self.projection_operator = CloudProjection(self.nrelation, self.relation_dim)
         self.intersection_operator = CloudIntersection(self.entity_dim, self.n_vec)
         self.score_func = Score_Func()
 
+    def transform_union_query(self, queries, query_structure):
+        '''
+        transform 2u queries to two 1p queries
+        transform up queries to two 2p queries
+        '''
+        if self.query_name_dict[query_structure] == '2u-DNF':
+            queries = queries[:, :-1] # remove union -1
+        elif self.query_name_dict[query_structure] == 'up-DNF':
+            queries = torch.cat([torch.cat([queries[:, :2], queries[:, 5:6]], dim=1), torch.cat([queries[:, 2:4], queries[:, 5:6]], dim=1)], dim=1)
+        queries = torch.reshape(queries, [queries.shape[0]*2, -1])
+        return queries
 
-
+    def transform_union_structure(self, query_structure):
+        if self.query_name_dict[query_structure] == '2u-DNF':
+            return ('e', ('r',))
+        elif self.query_name_dict[query_structure] == 'up-DNF':
+            return ('e', ('r', 'r'))
 
     def calc_query(self, queries, query_structure, idx):
         '''
@@ -169,15 +172,12 @@ class Query2Cloud(nn.Module):
             for i in range(len(query_structure)):
                 embedding, idx = self.calc_query(queries, query_structure[i], idx)
                 embedding_list.append(embedding)
-            embedding = self.intersection_operator(embedding_list[0], embedding_list[1])
-
+            if len(embedding_list) < 3:
+                embedding = self.intersection_operator(embedding_list[0], embedding_list[1])
+            else:
+                embedding = self.intersection_operator(embedding_list[0], embedding_list[1], embedding_list[2])
         return embedding, idx
 
-    # Distance function
-    # def score_func(self, entity_embedding, query_embedding):
-    #     distance = entity_embedding - query_embedding
-    #     logit = self.gamma - torch.norm(distance, p=1, dim=-1)
-    #     return logit
 
     def forward(self, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict):
         all_center_embeddings, all_idxs = [], []
@@ -199,7 +199,7 @@ class Query2Cloud(nn.Module):
             all_center_embeddings = torch.cat(all_center_embeddings, dim=0)
         if len(all_union_center_embeddings) > 0:
             all_union_center_embeddings = torch.cat(all_union_center_embeddings, dim=0).unsqueeze(1)
-            all_union_center_embeddings = all_union_center_embeddings.view(all_union_center_embeddings.shape[0]//2, 2, 1, -1)
+            all_union_center_embeddings = all_union_center_embeddings.view(all_union_center_embeddings.shape[0]//2, 2, 8, -1)
 
         if type(subsampling_weight) != type(None):
             subsampling_weight = subsampling_weight[all_idxs+all_union_idxs]
@@ -216,7 +216,8 @@ class Query2Cloud(nn.Module):
 
             if len(all_union_center_embeddings) > 0:
                 positive_sample_union = positive_sample[all_union_idxs]
-                positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_union).unsqueeze(1).unsqueeze(1)
+                # positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_union).unsqueeze(1).unsqueeze(1)
+                positive_embedding = self.entity_embedding(positive_sample_union)
                 positive_union_logit = self.score_func(positive_embedding, all_union_center_embeddings)
                 positive_union_logit = torch.max(positive_union_logit, dim=1)[0]
             else:
@@ -242,8 +243,13 @@ class Query2Cloud(nn.Module):
                 negative_sample_union = negative_sample[all_union_idxs]
                 batch_size, negative_size = negative_sample_union.shape
                 # negative_embedding = torch.index_select(self.entity_embedding, dim=0, index=negative_sample_union.view(-1)).view(batch_size, 1, negative_size, -1)
-                negative_union_logit = self.score_func(all_union_center_embeddings, negative_embedding)
-                negative_union_logit = torch.max(negative_union_logit, dim=1)[0]
+                negative_embedding = self.entity_embedding(negative_sample_union.view(-1)).view(batch_size, negative_size, self.n_vec, -1)
+                all_union_center_embeddings = all_union_center_embeddings.transpose(0,1)
+                negative_union_logit = self.score_func(all_union_center_embeddings[0], negative_embedding).unsqueeze(0)
+                for i in range(all_union_center_embeddings.shape[0]-1):
+                    logit = self.score_func(all_union_center_embeddings[i+1], negative_embedding).unsqueeze(0)
+                    negative_union_logit = torch.cat([negative_union_logit, logit], dim=0)
+                negative_union_logit = torch.max(negative_union_logit, dim=0)[0]
             else:
                 negative_union_logit = torch.Tensor([]).to(self.entity_embedding.entity_embeddings.weight.device)
             negative_logit = torch.cat([negative_logit, negative_union_logit], dim=0)
@@ -252,6 +258,22 @@ class Query2Cloud(nn.Module):
 
         return positive_logit, negative_logit, subsampling_weight, all_idxs+all_union_idxs
 
+    @staticmethod
+    def loss_log_sigmoid(positive_logit, negative_logit, subsampling_weight):
+        negative_score = F.logsigmoid(-negative_logit).mean(dim=1)
+        positive_score = F.logsigmoid(positive_logit)
+        positive_sample_loss = - (subsampling_weight * positive_score).sum()
+        negative_sample_loss = - (subsampling_weight * negative_score).sum()
+        positive_sample_loss /= subsampling_weight.sum()
+        negative_sample_loss /= subsampling_weight.sum()
+        return (positive_sample_loss + negative_sample_loss) / 2, positive_sample_loss, negative_sample_loss
+
+    @staticmethod
+    def margin_loss(positive_logit, negative_logit, subsampling_weight, margin = 1):
+        negative_score = negative_logit.mean(dim=1)
+        positive_score = positive_logit
+        loss = margin + subsampling_weight * positive_score - (subsampling_weight * negative_score)
+        return loss.mean(), positive_score.mean(), negative_score.mean()
 
     @staticmethod
     def train_step(model, optimizer, train_iterator, args, step):
@@ -278,14 +300,7 @@ class Query2Cloud(nn.Module):
                                                                       subsampling_weight, batch_queries_dict,
                                                                       batch_idxs_dict)
 
-        negative_score = F.logsigmoid(-negative_logit).mean(dim=1)
-        positive_score = F.logsigmoid(positive_logit)
-        positive_sample_loss = - (subsampling_weight * positive_score).sum()
-        negative_sample_loss = - (subsampling_weight * negative_score).sum()
-        positive_sample_loss /= subsampling_weight.sum()
-        negative_sample_loss /= subsampling_weight.sum()
-
-        loss = (positive_sample_loss + negative_sample_loss) / 2
+        loss, positive_sample_loss, negative_sample_loss = model.margin_loss(positive_logit=positive_logit, negative_logit=negative_logit, subsampling_weight=subsampling_weight)
         loss.backward()
         optimizer.step()
         log = {
